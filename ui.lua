@@ -45,16 +45,19 @@ local Theme = {
 	Text = Color3.fromRGB(236, 236, 242),
 	SubText = Color3.fromRGB(139, 139, 150),
 	White = Color3.new(1, 1, 1),
+	Success = Color3.fromRGB(126, 232, 192),
+	Error = Color3.fromRGB(255, 107, 107),
 	Font = Enum.Font.GothamMedium,
 	FontBold = Enum.Font.GothamBold,
 }
 Theme.Accent2 = darker(Theme.Accent)
 
 local library = {
-	Version = "0.3.0",
+	Version = "0.4.0",
 	Flags = {},
 	Elements = {},
 	Windows = {},
+	KeySystems = {},
 	Theme = Theme,
 	_listening = false,
 	_lastBind = 0,
@@ -776,6 +779,9 @@ end
 function library:Unload()
 	for i = #library.Windows, 1, -1 do
 		library.Windows[i]:Destroy()
+	end
+	for i = #library.KeySystems, 1, -1 do
+		library.KeySystems[i]:Destroy()
 	end
 	library._listening = false
 	table.clear(accentListeners)
@@ -1806,6 +1812,629 @@ for _, name in ipairs({ "AddSeparator", "AddLabel", "AddToggle", "AddButton", "A
 		return sec[name](sec, ...)
 	end
 end
+
+--------------------------------------------------------------------------------
+-- KEY SYSTEM
+-- One call: library.NewKeySystem({ ... }) -> small centered window with a key box,
+-- a "Check Key" button and a "Get Key" button.
+--
+-- Options (all optional):
+--   Title        string   window title            (default "Velune Key System")
+--   Subtitle     string   gray text next to title (default "")
+--   Heading      string   big text in the box     (default "Authentication Required")
+--   Description  string   small text under it     (default "Enter your key to continue.")
+--   Placeholder  string   textbox placeholder     (default "Enter your key...")
+--   CheckText    string   check button text       (default "Check Key")
+--   GetKeyText   string   get key button text     (default "Get Key")
+--   Link         string   copied to clipboard when Get Key is pressed (if no OnGetKey)
+--   Closable     bool     show the X button       (default true)
+--   CloseOnSuccess bool   close after valid key   (default true)
+--   OnCheck(key, ks)  -> return true / false [, message]. May yield (HTTP etc.)
+--   OnGetKey(ks)      custom Get Key behaviour (replaces the clipboard default)
+--   OnSuccess(key, ks) runs after OnCheck returned true
+--   OnClose(ks)       runs when the X button is pressed
+--------------------------------------------------------------------------------
+local KeySystem = {}
+KeySystem.__index = KeySystem
+
+local KS_W, KS_H = 300, 260
+
+function library.NewKeySystem(opts)
+	if type(opts) ~= "table" then
+		opts = {}
+	end
+	local title = tostring(opts.Title or "Velune Key System")
+	local subtitle = tostring(opts.Subtitle or "")
+
+	local self = setmetatable({
+		Options = opts,
+		Connections = {},
+		Closed = false,
+		_busy = false,
+	}, KeySystem)
+
+	local function kx(px) return px / KS_W end
+	local function ky(px) return px / KS_H end
+
+	local gui = create("ScreenGui", {
+		Name = HttpService:GenerateGUID(false),
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 1000,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	})
+	pcall(function()
+		if syn and syn.protect_gui then
+			syn.protect_gui(gui)
+		end
+	end)
+	gui.Parent = getGuiParent()
+	self.Gui = gui
+
+	local function vpSize()
+		local s = gui.AbsoluteSize
+		if s.X <= 0 or s.Y <= 0 then
+			local cam = workspace.CurrentCamera
+			s = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+		end
+		return s
+	end
+	local function heightScale()
+		return (vpSize().Y < 720) and 0.7 or 0.42
+	end
+
+	-- Root: fraction of the screen, locked to the window's aspect ratio
+	local root = create("Frame", {
+		Name = "Root",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.9, heightScale()),
+		BackgroundTransparency = 1,
+		Parent = gui,
+	})
+	create("UIAspectRatioConstraint", {
+		AspectRatio = KS_W / KS_H,
+		AspectType = Enum.AspectType.FitWithinMaxSize,
+		DominantAxis = Enum.DominantAxis.Width,
+		Parent = root,
+	})
+
+	local main = create("CanvasGroup", {
+		Name = "Main",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		GroupTransparency = 1,
+		Parent = root,
+	})
+	create("UICorner", { CornerRadius = UDim.new(12 / KS_W, 0), Parent = main })
+
+	local pop = { v = 0.92 }
+	local function getK()
+		local vp = vpSize()
+		return math.min(vp.X * 0.9 / KS_W, vp.Y * heightScale() / KS_H)
+	end
+	local canvas, updateScale = makeScaler(main, getK, pop)
+	local popValue = create("NumberValue", { Value = 0.92 })
+	popValue.Changed:Connect(function(v)
+		pop.v = v
+		updateScale()
+	end)
+	self._popValue = popValue
+	self.Root, self.Main, self.Canvas = root, main, canvas
+
+	-- background (same glass look as the main window)
+	local bg = create("Frame", {
+		Name = "Background",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Theme.White,
+		BackgroundTransparency = 0.12,
+		BorderSizePixel = 0,
+		ZIndex = 0,
+		Parent = canvas,
+	})
+	create("UIGradient", {
+		Color = ColorSequence.new(Color3.fromRGB(30, 30, 37), Color3.fromRGB(14, 14, 18)),
+		Rotation = 65,
+		Parent = bg,
+	})
+
+	local glow = create("Frame", {
+		Name = "Glow",
+		Size = UDim2.new(1, 0, ky(110), 0),
+		BackgroundColor3 = Theme.White,
+		BorderSizePixel = 0,
+		Parent = canvas,
+	})
+	do
+		local g = create("UIGradient", {
+			Rotation = 90,
+			Transparency = NumberSequence.new(0.86, 1),
+			Parent = glow,
+		})
+		onAccent(function()
+			g.Color = ColorSequence.new(Theme.Accent)
+		end)
+	end
+
+	local topLine = create("Frame", {
+		Name = "TopLine",
+		Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = Theme.White,
+		BorderSizePixel = 0,
+		Parent = canvas,
+	})
+	do
+		local g = create("UIGradient", {
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 1),
+				NumberSequenceKeypoint.new(0.5, 0.1),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+			Parent = topLine,
+		})
+		onAccent(function()
+			g.Color = ColorSequence.new(Theme.Accent, Theme.Accent2)
+		end)
+	end
+
+	-- Header: logo + title
+	local header = create("Frame", {
+		Name = "Header",
+		Size = UDim2.new(1, 0, ky(34), 0),
+		BackgroundTransparency = 1,
+		Parent = canvas,
+	})
+
+	local logoHolder = create("Frame", {
+		Name = "Logo",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(kx(16), 0, 0.5, 0),
+		Size = UDim2.fromOffset(LOGO_SIZE, LOGO_SIZE),
+		BackgroundTransparency = 1,
+		Parent = header,
+	})
+	for _, layer in ipairs({
+		{ scale = 1.75, base = 0.94 },
+		{ scale = 1.42, base = 0.89 },
+		{ scale = 1.18, base = 0.82 },
+		}) do
+		local img = create("ImageLabel", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromScale(layer.scale, layer.scale),
+			BackgroundTransparency = 1,
+			Image = LOGO_ID,
+			ScaleType = Enum.ScaleType.Fit,
+			ImageTransparency = layer.base,
+			Parent = logoHolder,
+		})
+		onAccent(function()
+			img.ImageColor3 = Theme.Accent
+		end)
+		TweenService:Create(
+			img,
+			TweenInfo.new(2.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+			{ ImageTransparency = math.min(layer.base + 0.07, 1) }
+		):Play()
+	end
+	create("ImageLabel", {
+		Name = "LogoImage",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Image = LOGO_ID,
+		ScaleType = Enum.ScaleType.Fit,
+		Parent = logoHolder,
+	})
+
+	local titleHolder = create("Frame", {
+		Position = UDim2.fromScale(kx(16 + LOGO_SIZE + 9), 0),
+		Size = UDim2.new(0, 0, 1, 0),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		Parent = header,
+	})
+	create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = titleHolder,
+	})
+	-- "Velune" in white, the rest in the accent color
+	local tFirst, tRest = title:match("^(%S+)%s+(.+)$")
+	local titleLabel = create("TextLabel", {
+		LayoutOrder = 1,
+		Size = UDim2.new(0, 0, 0, 20),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		RichText = true,
+		Text = title,
+		Font = Theme.FontBold,
+		TextSize = 14,
+		TextColor3 = Theme.Text,
+		Parent = titleHolder,
+	})
+	onAccent(function()
+		if tFirst then
+			titleLabel.Text = string.format('%s <font color="#%s">%s</font>', tFirst, Theme.Accent:ToHex(), tRest)
+		else
+			titleLabel.Text = title
+		end
+	end)
+	if subtitle ~= "" then
+		create("TextLabel", {
+			LayoutOrder = 2,
+			Size = UDim2.new(0, 0, 0, 20),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundTransparency = 1,
+			Text = subtitle,
+			Font = Theme.Font,
+			TextSize = 11,
+			TextColor3 = Theme.SubText,
+			Parent = titleHolder,
+		})
+	end
+
+	-- close button (top right)
+	if opts.Closable ~= false then
+		local closeBtn = create("TextButton", {
+			Name = "Close",
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			Size = UDim2.fromOffset(22, 22),
+			BackgroundTransparency = 1,
+			AutoButtonColor = false,
+			Text = "x",
+			Font = Theme.Font,
+			TextSize = 14,
+			TextColor3 = Theme.SubText,
+			Parent = header,
+		})
+		hover(closeBtn, function()
+			tween(closeBtn, { TextColor3 = Theme.Accent }, 0.15)
+		end, function()
+			tween(closeBtn, { TextColor3 = Theme.SubText }, 0.15)
+		end)
+		closeBtn.MouseButton1Click:Connect(function()
+			if opts.OnClose then
+				task.spawn(opts.OnClose, self)
+			end
+			self:Close()
+		end)
+	end
+
+	-- Inner frame
+	local inner = create("Frame", {
+		Name = "Inner",
+		Position = UDim2.fromScale(kx(10), ky(34)),
+		Size = UDim2.fromScale(1 - kx(20), 1 - ky(44)),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.72,
+		BorderSizePixel = 0,
+		Parent = canvas,
+	})
+	corner(inner, 8)
+	stroke(inner, Theme.White, 0.9)
+
+	makeLabel(inner, tostring(opts.Heading or "Authentication Required"), {
+		Position = UDim2.fromOffset(0, 20),
+		Size = UDim2.new(1, 0, 0, 18),
+		Font = Theme.FontBold,
+		TextSize = 14,
+		TextColor3 = Theme.Text,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+	makeLabel(inner, tostring(opts.Description or "Enter your key to continue."), {
+		Position = UDim2.fromOffset(0, 40),
+		Size = UDim2.new(1, 0, 0, 14),
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+
+	makeLabel(inner, "Key", {
+		Position = UDim2.fromOffset(16, 76),
+		Size = UDim2.new(1, -32, 0, 14),
+	})
+	local boxHolder = create("Frame", {
+		Name = "BoxHolder",
+		Position = UDim2.fromOffset(16, 94),
+		Size = UDim2.new(1, -32, 0, 30),
+		BackgroundTransparency = 1,
+		Parent = inner,
+	})
+	local tb = create("TextBox", {
+		Name = "KeyBox",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Theme.Element,
+		BackgroundTransparency = 0.1,
+		Text = "",
+		PlaceholderText = tostring(opts.Placeholder or "Enter your key..."),
+		PlaceholderColor3 = Color3.fromRGB(95, 95, 105),
+		TextColor3 = Theme.Text,
+		Font = Theme.Font,
+		TextSize = 12,
+		ClearTextOnFocus = false,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = boxHolder,
+	})
+	corner(tb, 5)
+	padding(tb, 10, 0, 10, 0)
+	local tbStroke = stroke(tb, Theme.White, 0.9)
+	self.Textbox = tb
+
+	tb.Focused:Connect(function()
+		tween(tbStroke, { Color = Theme.Accent, Transparency = 0.45 }, 0.15)
+	end)
+
+	local statusLabel = makeLabel(inner, "", {
+		Position = UDim2.fromOffset(16, 134),
+		Size = UDim2.new(1, -32, 0, 14),
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+
+	-- buttons
+	local function makeButton(text, primary, position, size)
+		local btn = create("TextButton", {
+			Position = position,
+			Size = size,
+			BackgroundColor3 = Theme.Element,
+			BackgroundTransparency = 0.1,
+			AutoButtonColor = false,
+			Text = text,
+			Font = primary and Theme.FontBold or Theme.Font,
+			TextSize = 12,
+			TextColor3 = Theme.Text,
+			Parent = inner,
+		})
+		corner(btn, 5)
+		local bs = stroke(btn, Theme.White, 0.9)
+		local function base()
+			return primary and Theme.Element:Lerp(Theme.Accent, 0.16) or Theme.Element
+		end
+		local function restStroke()
+			if primary then
+				return Theme.Accent, 0.65
+			end
+			return Theme.White, 0.9
+		end
+		onAccent(function()
+			btn.BackgroundColor3 = base()
+			local c, t = restStroke()
+			bs.Color, bs.Transparency = c, t
+		end)
+		hover(btn, function()
+			tween(btn, { BackgroundColor3 = base():Lerp(Theme.Accent, 0.14) }, 0.15)
+			tween(bs, { Color = Theme.Accent, Transparency = 0.5 }, 0.15)
+		end, function()
+			local c, t = restStroke()
+			tween(btn, { BackgroundColor3 = base() }, 0.15)
+			tween(bs, { Color = c, Transparency = t }, 0.15)
+		end)
+		btn.MouseButton1Down:Connect(function()
+			btn.BackgroundColor3 = base():Lerp(Theme.Accent, 0.35)
+			tween(btn, { BackgroundColor3 = base():Lerp(Theme.Accent, 0.14) }, 0.35)
+		end)
+		return btn
+	end
+
+	local checkBtn = makeButton(
+		tostring(opts.CheckText or "Check Key"), true,
+		UDim2.new(0, 16, 0, 160), UDim2.new(0.5, -20, 0, 30)
+	)
+	local getBtn = makeButton(
+		tostring(opts.GetKeyText or "Get Key"), false,
+		UDim2.new(0.5, 4, 0, 160), UDim2.new(0.5, -20, 0, 30)
+	)
+	self.CheckButton, self.GetKeyButton = checkBtn, getBtn
+
+	-- animated border on top of everything
+	local edge = create("Frame", {
+		Name = "Edge",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ZIndex = 20,
+		Parent = canvas,
+	})
+	corner(edge, 12)
+	do
+		local s = stroke(edge, Theme.White, 0.45, 1)
+		local g = create("UIGradient", { Rotation = 35, Parent = s })
+		onAccent(function()
+			g.Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Theme.Accent),
+				ColorSequenceKeypoint.new(0.5, Color3.fromRGB(70, 70, 82)),
+				ColorSequenceKeypoint.new(1, Theme.Accent2),
+			})
+		end)
+	end
+
+	--// behaviour
+	function self:SetStatus(text, kind)
+		statusLabel.Text = tostring(text or "")
+		if kind == "success" then
+			statusLabel.TextColor3 = Theme.Success
+		elseif kind == "error" then
+			statusLabel.TextColor3 = Theme.Error
+		else
+			statusLabel.TextColor3 = Theme.SubText
+		end
+		statusLabel.TextTransparency = 1
+		tween(statusLabel, { TextTransparency = 0 }, 0.2)
+	end
+
+	function self:GetKey()
+		return (tb.Text:match("^%s*(.-)%s*$"))
+	end
+
+	function self:SetKey(k)
+		tb.Text = tostring(k or "")
+	end
+
+	function self:Shake()
+		task.spawn(function()
+			for _, off in ipairs({ 6, -6, 4, -4, 0 }) do
+				if self.Closed then
+					return
+				end
+				tween(boxHolder, { Position = UDim2.fromOffset(16 + off, 94) }, 0.045, Enum.EasingStyle.Sine)
+				task.wait(0.045)
+			end
+		end)
+		tween(tbStroke, { Color = Theme.Error, Transparency = 0.35 }, 0.15)
+		task.delay(0.8, function()
+			if not self.Closed then
+				tween(tbStroke, { Color = Theme.White, Transparency = 0.9 }, 0.2)
+			end
+		end)
+	end
+
+	function self:Check()
+		if self._busy or self.Closed then
+			return
+		end
+		local key = self:GetKey()
+		if key == "" then
+			self:SetStatus("Please enter a key", "error")
+			self:Shake()
+			return
+		end
+		self._busy = true
+		local oldText = checkBtn.Text
+		checkBtn.Text = "Checking..."
+		self:SetStatus("")
+		task.spawn(function()
+			if not opts.OnCheck then
+				self:SetStatus("No OnCheck callback set", "error")
+			else
+				local ok, res, msg = pcall(opts.OnCheck, key, self)
+				if not ok then
+					self:SetStatus("Callback error, see console", "error")
+					warn("[velune.gg] KeySystem OnCheck error: " .. tostring(res))
+				elseif res == true then
+					self:SetStatus(msg or "Key valid", "success")
+					if opts.OnSuccess then
+						task.spawn(opts.OnSuccess, key, self)
+					end
+					if opts.CloseOnSuccess ~= false then
+						task.delay(0.8, function()
+							self:Close()
+						end)
+					end
+				elseif res == false then
+					self:SetStatus(msg or "Invalid key", "error")
+					self:Shake()
+				end
+			end
+			if not self.Closed then
+				checkBtn.Text = oldText
+			end
+			self._busy = false
+		end)
+	end
+
+	function self:GetKeyPressed()
+		if opts.OnGetKey then
+			task.spawn(function()
+				local ok, err = pcall(opts.OnGetKey, self)
+				if not ok then
+					warn("[velune.gg] KeySystem OnGetKey error: " .. tostring(err))
+				end
+			end)
+			return
+		end
+		if opts.Link and type(setclipboard) == "function" then
+			local ok = pcall(setclipboard, tostring(opts.Link))
+			self:SetStatus(ok and "Link copied to clipboard" or "Could not copy link", ok and "success" or "error")
+		elseif opts.Link then
+			self:SetStatus(tostring(opts.Link), "info")
+		else
+			self:SetStatus("No link set", "error")
+		end
+	end
+
+	function self:Close()
+		if self.Closed then
+			return
+		end
+		self.Closed = true
+		tween(main, { GroupTransparency = 1 }, 0.2)
+		tween(popValue, { Value = 0.94 }, 0.2)
+		task.delay(0.25, function()
+			self:Destroy()
+		end)
+	end
+
+	function self:Destroy()
+		self.Closed = true
+		for _, c in ipairs(self.Connections) do
+			pcall(function() c:Disconnect() end)
+		end
+		self.Connections = {}
+		pcall(function() popValue:Destroy() end)
+		pcall(function() gui:Destroy() end)
+		local i = table.find(library.KeySystems, self)
+		if i then
+			table.remove(library.KeySystems, i)
+		end
+	end
+
+	checkBtn.MouseButton1Click:Connect(function()
+		self:Check()
+	end)
+	getBtn.MouseButton1Click:Connect(function()
+		self:GetKeyPressed()
+	end)
+	tb.FocusLost:Connect(function(enter)
+		tween(tbStroke, { Color = Theme.White, Transparency = 0.9 }, 0.15)
+		if enter then
+			self:Check()
+		end
+	end)
+
+	-- dragging (by the header)
+	do
+		local dragging, dragStart, startPos = false, nil, nil
+		header.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				dragStart = input.Position
+				startPos = root.Position
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then
+						dragging = false
+					end
+				end)
+			end
+		end)
+		table.insert(self.Connections, UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				local d = input.Position - dragStart
+				local vp = vpSize()
+				tween(root, {
+					Position = UDim2.fromScale(startPos.X.Scale + d.X / vp.X, startPos.Y.Scale + d.Y / vp.Y),
+				}, 0.08, Enum.EasingStyle.Sine)
+			end
+		end))
+	end
+
+	-- keep it scaled on resize / rotation
+	table.insert(self.Connections, gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		root.Size = UDim2.fromScale(0.9, heightScale())
+		updateScale()
+	end))
+
+	table.insert(library.KeySystems, self)
+
+	-- open animation
+	tween(main, { GroupTransparency = 0 }, 0.3)
+	tween(popValue, { Value = 1 }, 0.4, Enum.EasingStyle.Back)
+
+	return self
+end
+library.KeySystem = library.NewKeySystem
 
 --------------------------------------------------------------------------------
 -- CONFIGS
