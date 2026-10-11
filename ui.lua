@@ -2345,13 +2345,13 @@ function library.NewKeySystem(opts)
 			end)
 			return
 		end
-		if opts.Link and type(setclipboard) == "function" then
+		if type(setclipboard) == "function" and opts.Link then
 			local ok = pcall(setclipboard, tostring(opts.Link))
-			self:SetStatus(ok and "Link copied to clipboard" or "Could not copy link", ok and "success" or "error")
-		elseif opts.Link then
-			self:SetStatus(tostring(opts.Link), "info")
-		else
+			self:SetStatus(ok and "Copied link" or "Could not copy link", ok and "success" or "error")
+		elseif not opts.Link then
 			self:SetStatus("No link set", "error")
+		else
+			self:SetStatus("Clipboard unavailable", "error")
 		end
 	end
 
